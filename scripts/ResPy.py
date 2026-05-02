@@ -20,18 +20,18 @@ how many unique kmers of it were found / total unique kmers of it. We need 100% 
 
 import gzip
 import sys
+from array import array
+
 
 class ResistanceFinder:
     def __init__(self, k=19):
         self.k = k
-        self.kmer_db = {}  # kmer -> list of (gene_index, pos)
-        self.genes = []    # List of (name, sequence, depth)
-        
-        # Create reverse complement table
-        self.reverse_table = str.maketrans("ACGT", "TGCA")
+        self.kmer_db = {}  # kmer -> list of (gene_idx, pos)
+        self.genes = []    # List of dictionaries
+        self.trans_table = str.maketrans("ACGT", "TGCA")
+
 
     def load_fasta(self, fasta_path):
-        """Parsing the fasta with the resistance genes and building the k-mer indexes"""
         print(f"Indexing FASTA: {fasta_path}")
         with open(fasta_path, 'r') as f:
             name, seq = None, []
@@ -47,21 +47,103 @@ class ResistanceFinder:
             if name:
                 self._process_gene(name, "".join(seq))
 
+
     def _process_gene(self, name, sequence):
-	'''Extracting info about the resistance genes'''
         gene_idx = len(self.genes)
         sequence = sequence.upper()
-        # Tracking depth: a number for each basepair, if a kmer is found in that position, +1 to that number
-        depth = [0] * len(sequence)
-        self.genes.append({'name': name, 'seq': sequence, 'depth': depth})
+        # Difference array: length + 1 to handle the boundary of 'pos + k'
+        # Using 'i' for signed integers for negative values
+        diff_arr = array('i', [0] * (len(sequence) + 1))
+        self.genes.append({'name': name, 'seq': sequence, 'diff': diff_arr})
 
-        # Slide window to find all kmer-s and put them in kmer_db
+
+        # Slide window to populate kmer_db
+        db = self.kmer_db
         for i in range(len(sequence) - self.k + 1):
             kmer = sequence[i:i+self.k]
-            if kmer not in self.kmer_db:
-                self.kmer_db[kmer] = []
-            self.kmer_db[kmer].append((gene_idx, i))
+            if kmer not in db:
+                db[kmer] = []
+            db[kmer].append((gene_idx, i))
+
 
     def _get_rev_comp(self, seq):
         return seq.translate(self.trans_table)[::-1]
+
+
+    def process_fastq(self, fastq_path):
+        print(f"Processing FASTQ: {fastq_path}")
+        # Localize k and map_read function for speed
+        k = self.k
+        db = self.kmer_db
+        genes = self.genes
+       
+        with gzip.open(fastq_path, 'rt') as f:
+            for i, line in enumerate(f):
+                if i % 4 == 1:
+                    read = line.strip().upper()
+                    # Inline mapping - new step
+                    for sequence_variant in (read, self._get_rev_comp(read)):
+                        for j in range(len(sequence_variant) - k + 1):
+                            kmer = sequence_variant[j:j+k]
+                            if kmer in db:
+                                for gene_idx, pos in db[kmer]:
+                                    d = genes[gene_idx]['diff']
+                                    d[pos] += 1
+                                    d[pos + k] -= 1
+
+
+    def report(self, min_coverage=0.95, min_depth=10):
+        print(f"\n{'Gene Name':<50} | {'Coverage':<10} | {'Avg Depth':<10}")
+        print("-" * 75)
+       
+        results = []
+        for gene in self.genes:
+            diff = gene['diff']
+            length = len(gene['seq'])
+           
+            # Reconstruct actual depth from difference array - prefi sum method, new step
+            actual_depth = [0] * length
+            current_val = 0
+            covered_bases = 0
+            total_sum = 0
+           
+            for i in range(length):
+                current_val += diff[i]
+                actual_depth[i] = current_val
+                if current_val > 0:
+                    covered_bases += 1
+                    total_sum += current_val
+           
+            coverage = covered_bases / length
+            avg_depth = total_sum / length
+           
+            if coverage >= min_coverage and avg_depth >= min_depth:
+                results.append({
+                    'name': gene['name'],
+                    'coverage': coverage,
+                    'depth': avg_depth
+                })
+
+
+        results.sort(key=lambda x: (x['coverage'], x['depth']), reverse=True)
+        for r in results:
+            print(f"{r['name'][:50]:<50} | {r['coverage']:>9.2%} | {r['depth']:>10.2f}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        # Defaults for your specific files
+        default_fasta = "resistance_genes.fsa.txt"
+        default_fastq = "Unknown3_raw_reads_1.txt.gz"
+       
+        scanner = ResistanceFinder(k=19)
+        scanner.load_fasta(default_fasta)
+        scanner.process_fastq(default_fastq)
+        scanner.report()
+    else:
+        scanner = ResistanceFinder(k=19)
+        scanner.load_fasta(sys.argv[1])
+        scanner.process_fastq(sys.argv[2])
+        scanner.report()
+
 
